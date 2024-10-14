@@ -18,10 +18,21 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
-    "commands": [
+    "configuration": [
       {
-        "command": "sass-alias.helloWorld",
-        "title": "Hello World"
+        "title": "Sass/SCSS/CSS Link Fixer",
+        "properties": {
+          "sass-alias.enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Enable/disable the extension"
+          },
+          "sass-alias.debugMode": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable/disable debug mode"
+          }
+        }
       }
     ]
   },

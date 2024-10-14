@@ -1,8 +1,19 @@
 import * as vscode from 'vscode'
 import * as path from 'path'
-import * as fs from 'fs'
+import * as fs from 'fs/promises'
 
 const outputChannel = vscode.window.createOutputChannel('Sass Alias Fixer')
+let extensionConfig = vscode.workspace.getConfiguration('sass-alias')
+let debugMode = extensionConfig.get<boolean>('debugMode', false)
+let isEnabled = extensionConfig.get<boolean>('enabled', true)
+let isDevelopment = false
+let provider: vscode.Disposable | undefined
+
+function debug(msg: string) {
+	if (debugMode || isDevelopment) {
+		outputChannel.appendLine(msg)
+	}
+}
 
 type ConfigCacheEntry = {
 	aliases: Record<string, string[]>,
@@ -11,82 +22,68 @@ type ConfigCacheEntry = {
 }
 
 let configCache: Record<string, ConfigCacheEntry> = {}
-
+let configPathCache: Record<string, string | null> = {}
 let documentLinkCache: Record<string, vscode.DocumentLink[]> = {}
 
-// Find the nearest tsconfig.json or jsconfig.json
-function findNearestConfig(fileDir: string): string | null {
+const importRegex = /@(?:use|import)\s*['"]([^'"]+)['"]/g
+
+async function findNearestConfig(fileDir: string): Promise<string | null> {
 	let currentDir = fileDir
 
 	while (currentDir !== path.parse(currentDir).root) {
-		// Check if the directory is already in the config cache
-		if (configCache[currentDir]) {
-			outputChannel.appendLine(`Using cached config for directory: ${fileDir}`)
-			return configCache[currentDir].configPath
+		if (configPathCache[currentDir]) {
+			return configPathCache[currentDir]
 		}
 
-		outputChannel.appendLine(`Searching for tsconfig.json or jsconfig.json starting from: ${currentDir}`)
+		debug(`Searching for tsconfig.json or jsconfig.json starting from: ${currentDir}`)
 
 		const tsConfigPath = path.join(currentDir, 'tsconfig.json')
-		if (fs.existsSync(tsConfigPath)) {
-			outputChannel.appendLine(`Found tsconfig.json at: ${tsConfigPath}`)
+
+		if (await fileExists(tsConfigPath)) {
+			debug(`Found tsconfig.json at: ${tsConfigPath}`)
+			configPathCache[currentDir] = tsConfigPath
 			return tsConfigPath
 		}
 
 		const jsConfigPath = path.join(currentDir, 'jsconfig.json')
-		if (fs.existsSync(jsConfigPath)) {
-			outputChannel.appendLine(`Found jsconfig.json at: ${jsConfigPath}`)
+		if (await fileExists(jsConfigPath)) {
+			debug(`Found jsconfig.json at: ${jsConfigPath}`)
+			configPathCache[currentDir] = jsConfigPath
 			return jsConfigPath
 		}
 
-		// Move up one directory level
+		configPathCache[currentDir] = null
 		currentDir = path.dirname(currentDir)
 	}
 
-	outputChannel.appendLine('No tsconfig.json or jsconfig.json found in project hierarchy')
+	debug('No tsconfig.json or jsconfig.json found in project hierarchy')
 	return null
 }
 
-// Function to parse the nearest tsconfig.json or jsconfig.json and extract alias mappings
-function getTsConfigAliases(document: vscode.TextDocument): Record<string, string[]> {
-	const fileDir = path.dirname(document.fileName)
-	const configPath = findNearestConfig(fileDir)
-
-	if (!configPath) {
-		outputChannel.appendLine('No tsconfig.json or jsconfig.json found')
-		return {}
-	}
-
-	const stat = fs.statSync(configPath)
+async function getTsConfigAliases(configPath: string): Promise<Record<string, string[]>> {
+	const stat = await fs.stat(configPath)
 	const lastModified = stat.mtimeMs
 
-	// Check if the directory is cached and if the config file has been modified
-	const cachedConfig = configCache[fileDir]
+	const cachedConfig = configCache[configPath]
 	if (cachedConfig && cachedConfig.lastModified === lastModified) {
-		outputChannel.appendLine(`Using cached aliases for directory: ${fileDir}`)
+		debug(`Using cached aliases for config: ${configPath}`)
 		return cachedConfig.aliases
 	}
 
-	outputChannel.appendLine(`Parsing config file: ${configPath} (modified: ${lastModified})`)
+	debug(`Parsing config file: ${configPath} (modified: ${lastModified})`)
 
-	const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+	const configContent = await fs.readFile(configPath, 'utf-8')
+	const config = JSON.parse(configContent)
 	const paths = config.compilerOptions?.paths || {}
 
-	if (Object.keys(paths).length === 0) {
-		outputChannel.appendLine('No paths found in tsconfig.json/jsconfig.json')
-	} else {
-		outputChannel.appendLine('Found paths in config.')
-	}
-
 	const aliases: Record<string, string[]> = {}
-	Object.keys(paths).forEach(alias => {
+	for (const alias in paths) {
 		const actualPaths = paths[alias].map((p: string) => path.resolve(path.dirname(configPath), p.replace('/*', '')))
 		aliases[alias.replace('/*', '')] = actualPaths
-	})
-	outputChannel.appendLine(`Found aliases: ${Object.keys(aliases)}`)
+	}
+	debug(`Found aliases: ${Object.keys(aliases)}`)
 
-	// Update the cache with the new configuration, modified time, and config path
-	configCache[fileDir] = {
+	configCache[configPath] = {
 		aliases,
 		lastModified,
 		configPath
@@ -95,112 +92,180 @@ function getTsConfigAliases(document: vscode.TextDocument): Record<string, strin
 	return aliases
 }
 
-// Function to resolve aliases from the preloaded aliases
-function resolveAlias(importPath: string, aliases: Record<string, string[]>): string | null {
+async function tryWithExtensions(document: vscode.TextDocument, importPath: string): Promise<string | null> {
+	const filePath = path.join(path.dirname(document.fileName), importPath)
+	debug(`Trying import path with extensions: ${filePath}`)
+	const extensions = ['', '.sass', '.scss', '.css']
+	for (const ext of extensions) {
+		const possiblePath = filePath + ext
+		if (await fileExists(possiblePath)) {
+			debug(`Found file with extension: ${possiblePath}`)
+			return possiblePath
+		}
+	}
+	debug(`No file found with any of the extensions: ${extensions.join(', ')}`)
+	return null
+}
+
+async function resolveAlias(document: vscode.TextDocument, importPath: string, aliases: Record<string, string[]>): Promise<string | null> {
 	const aliasKey = Object.keys(aliases).find(alias => importPath.startsWith(alias))
 
 	if (!aliasKey) {
-		outputChannel.appendLine(`No alias found for import: ${importPath}`)
-		return null
+		debug(`No alias found for import: ${importPath}`)
+		return await tryWithExtensions(document, importPath)
 	}
 
 	const relativePath = importPath.replace(aliasKey, '')
-	const resolvedPaths = aliases[aliasKey].map(basePath => path.join(basePath, relativePath))
+	const basePaths = aliases[aliasKey]
 
-	outputChannel.appendLine(`Alias ${aliasKey} maps to: ${resolvedPaths}`)
-
-	// Return the first resolved path that exists
-	for (const resolvedPath of resolvedPaths) {
-		if (!fs.existsSync(resolvedPath)) {
-			// Fallback to default VS Code resolution
-			return null
+	for (const basePath of basePaths) {
+		const resolvedPath = path.join(basePath, relativePath)
+		if (!await fileExists(resolvedPath)) {
+			debug(`Resolved path does not exist: ${resolvedPath}`)
+			continue
 		}
 
-		if (!fs.lstatSync(resolvedPath).isDirectory()) {
-			outputChannel.appendLine(`Resolved path exists: ${resolvedPath}`)
+		const stat = await fs.stat(resolvedPath)
+		if (stat.isFile()) {
+			debug(`Resolved path exists: ${resolvedPath}`)
 			return resolvedPath
 		}
 
-		outputChannel.appendLine(`Resolved path is a directory: ${resolvedPath}`)
+		if (!stat.isDirectory()) {
+			debug(`Resolved path is not a file or directory: ${resolvedPath}`)
+			return null
+		}
+
+		debug(`Resolved path is a directory: ${resolvedPath}`)
 
 		// Try to find index.scss or main.scss inside the directory
 		const indexPath = path.join(resolvedPath, 'index.scss')
 		const mainPath = path.join(resolvedPath, 'main.scss')
 
-		if (fs.existsSync(indexPath)) {
-			outputChannel.appendLine(`Found index.scss at: ${indexPath}`)
+		if (await fileExists(indexPath)) {
+			debug(`Found index.scss at: ${indexPath}`)
 			return indexPath
-		} else if (fs.existsSync(mainPath)) {
-			outputChannel.appendLine(`Found main.scss at: ${mainPath}`)
-			return mainPath
-		} else {
-			outputChannel.appendLine(`No index.scss or main.scss found in: ${resolvedPath}`)
-			return null
 		}
-	}
-	outputChannel.appendLine(`No valid resolved path found for alias ${aliasKey}`)
 
+		if (await fileExists(mainPath)) {
+			debug(`Found main.scss at: ${mainPath}`)
+			return mainPath
+		}
+
+		debug(`No index.scss or main.scss found in: ${resolvedPath}`)
+		return null
+
+	}
+
+	debug(`No valid resolved path found for alias ${aliasKey}`)
 	return null
 }
 
-// This function gets called when the extension is activated
-export function activate(context: vscode.ExtensionContext) {
-	outputChannel.appendLine('Sass/SCSS/CSS Import Alias Link Fixer extension activated')
+async function fileExists(filePath: string): Promise<boolean> {
+	try {
+		await fs.access(filePath, fs.constants.R_OK)
+		return true
+	} catch {
+		return false
+	}
+}
 
-	// Register a listener for document changes to invalidate cache
+function registerProvider(context: vscode.ExtensionContext) {
+	provider = vscode.languages.registerDocumentLinkProvider(['scss', 'sass', 'css'], {
+		async provideDocumentLinks(document: vscode.TextDocument): Promise<vscode.DocumentLink[]> {
+			if (documentLinkCache[document.fileName]) {
+				debug(`Using cached links for document: ${document.fileName}`)
+				return documentLinkCache[document.fileName]
+			}
+
+			const links: vscode.DocumentLink[] = []
+			const fileDir = path.dirname(document.fileName)
+			const configPath = await findNearestConfig(fileDir)
+
+			if (!configPath) return []
+
+			const aliases = await getTsConfigAliases(configPath)
+			const text = document.getText()
+
+			let match: RegExpExecArray | null
+			while ((match = importRegex.exec(text)) !== null) {
+				const alias = match[1]
+				const startPos = document.positionAt(match.index + match[0].indexOf(alias))
+				const endPos = startPos.translate(0, alias.length)
+				const range = new vscode.Range(startPos, endPos)
+
+				const resolvedPath = await resolveAlias(document, alias, aliases)
+
+				if (resolvedPath) {
+					const resolvedUri = vscode.Uri.file(resolvedPath)
+					const link = new vscode.DocumentLink(range, resolvedUri)
+					links.push(link)
+					debug(`Resolved link for alias: ${alias} to ${resolvedUri.toString()}`)
+				}
+			}
+
+			documentLinkCache[document.fileName] = links
+			return links
+		}
+	})
+
+	context.subscriptions.push(provider)
+}
+
+export function activate(context: vscode.ExtensionContext) {
+	extensionConfig = vscode.workspace.getConfiguration('sass-alias')
+	debugMode = extensionConfig.get<boolean>('debugMode', false)
+	isEnabled = extensionConfig.get<boolean>('enabled', true)
+	isDevelopment = (context.extensionMode === vscode.ExtensionMode.Development)
+
+	if (!isEnabled) {
+		debug('Extension is disabled via settings.')
+		return
+	}
+
+	debug('Sass Alias Fixer extension activated')
+
 	vscode.workspace.onDidChangeTextDocument((event) => {
 		if (documentLinkCache[event.document.fileName]) {
-			outputChannel.appendLine(`Document edited: ${event.document.fileName}, invalidating link cache`)
+			debug(`Document edited: ${event.document.fileName}, invalidating link cache`)
 			delete documentLinkCache[event.document.fileName]
 		}
 	})
 
-	// Register a DocumentLinkProvider for .scss, .sass, and .css files
-	context.subscriptions.push(
-		vscode.languages.registerDocumentLinkProvider(['scss', 'sass', 'css'], {
-			provideDocumentLinks(document: vscode.TextDocument): vscode.DocumentLink[] {
-				// Return cached links if available
-				if (documentLinkCache[document.fileName]) {
-					outputChannel.appendLine(`Using cached links for document: ${document.fileName}`)
-					return documentLinkCache[document.fileName]
+	if (!provider) {
+		registerProvider(context)
+	}
+
+	// Listen for configuration changes
+	vscode.workspace.onDidChangeConfiguration((e) => {
+		if (e.affectsConfiguration('sass-alias.enabled')) {
+			extensionConfig = vscode.workspace.getConfiguration('sass-alias')
+			isEnabled = extensionConfig.get<boolean>('enabled', true)
+
+			if (!isEnabled) {
+				debug('Extension disabled via settings.')
+				// Dispose of the provider
+				if (provider) {
+					provider.dispose()
+					provider = undefined
 				}
-
-				// Generate new links if not cached
-				const links: vscode.DocumentLink[] = []
-				const aliases = getTsConfigAliases(document) // Load the aliases as usual
-				const text = document.getText()
-
-				// Regex to match @use or @import statements in SCSS/SASS
-				const regex = /@(?:use|import)\s*['"]([^'"]+)['"]/g
-				let match: RegExpExecArray | null
-
-				while ((match = regex.exec(text)) !== null) {
-					const alias = match[1]
-					const startPos = document.positionAt(match.index + match[0].indexOf(alias))
-					const endPos = startPos.translate(0, alias.length)
-					const range = new vscode.Range(startPos, endPos)
-
-					// Resolve the alias using the preloaded aliases
-					const resolvedPath = resolveAlias(alias, aliases)
-
-					if (resolvedPath && fs.existsSync(resolvedPath)) {
-						const resolvedUri = vscode.Uri.file(resolvedPath)
-						const link = new vscode.DocumentLink(range, resolvedUri)
-						links.push(link)
-						outputChannel.appendLine(`Resolved link for alias: ${alias} to ${resolvedUri.toString()}`)
-					}
+			} else {
+				debug('Extension enabled via settings.')
+				// Re-register the provider
+				if (!provider) {
+					registerProvider(context)
 				}
-
-				// Cache the generated links for future use
-				documentLinkCache[document.fileName] = links
-
-				return links
 			}
-		})
-	)
+		}
+
+		if (e.affectsConfiguration('sass-alias.debugMode')) {
+			extensionConfig = vscode.workspace.getConfiguration('sass-alias')
+			debugMode = extensionConfig.get<boolean>('debugMode', false)
+			debug('Debug mode changed via settings.')
+		}
+	})
 }
 
-// This function gets called when the extension is deactivated
 export function deactivate() {
-	outputChannel.appendLine('Sass/SCSS/CSS Import Alias Link Fixer extension deactivated')
+	debug('Sass Alias Fixer extension deactivated')
 }
